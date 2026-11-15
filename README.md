@@ -14,7 +14,7 @@ This project ingests multi-batch transaction datasets, calculates true turnaroun
 
 ## 🚀 Key Features
 
-* **Dynamic Multi-Batch Ingestion**: Automatically detects and consolidates all partitioned CSV files located in `data/` (`set1.csv`, `set2.csv`, `set3.csv`, etc.) into a unified DataFrame.
+* **Flexible Data Ingestion**: Loads `data/transactions.parquet` when available for faster startup, or automatically detects and consolidates partitioned CSV files in `data/` as a fallback.
 * **Granular Duration Banding**: Categorizes turnaround latency into user-defined operational brackets:
   * `1-5 seconds`
   * `6-10 seconds`
@@ -40,7 +40,7 @@ This project ingests multi-batch transaction datasets, calculates true turnaroun
 
 ## 📦 Data Sources & Git Large File Storage (Git LFS)
 
-The transaction datasets (`data/set1.csv`, `data/set2.csv`, `data/set3.csv`) exceed standard Git file size limits (~135 MB each, totaling over 3.1 million records). These files are managed and tracked using **Git LFS**.
+The transaction datasets (`data/set1.csv`, `data/set2.csv`, `data/set3.csv`) exceed standard Git file size limits (~135 MB each, totaling over 3.1 million records). These files are managed and tracked using **Git LFS**. For faster deployment startup, the app prefers the prepared `data/transactions.parquet` dataset when present; Parquet files in `data/` are also tracked using Git LFS.
 
 To clone the repository and retrieve the dataset files:
 
@@ -105,7 +105,8 @@ korba-latency/
 ├── data/                       # Transaction dataset partitions (Tracked with Git LFS)
 │   ├── set1.csv
 │   ├── set2.csv
-│   └── set3.csv
+│   ├── set3.csv
+│   └── transactions.parquet   # Optional prepared dataset for faster startup
 ├── .gitattributes              # Git LFS tracking rules
 ├── .gitignore                  # Git ignore rules for environments and temporary files
 ├── app.py                      # Main Streamlit analytics application
@@ -120,4 +121,3 @@ korba-latency/
 ## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-

@@ -223,18 +223,39 @@ def format_duration_friendly(seconds):
 @st.cache_data(show_spinner="Consolidating data files and computing latency...")
 def load_and_preprocess_combined_data(data_folder='data', single_file=None, inject_demo_pending=False):
     """
-    Loads all dataset parts, standardizes schemas, calculates duration manually from timestamps,
-    and handles Recon Actions.
+    Loads the prepared dataset when available, otherwise combines CSV parts,
+    standardizes schemas, calculates duration from timestamps, and handles Recon Actions.
     """
     if single_file is not None:
         df = pd.read_csv(single_file)
     else:
-        csv_files = sorted(glob.glob(os.path.join(data_folder, '*.csv')))
-        if not csv_files:
-            if os.path.exists('data.csv'):
-                df = pd.read_csv('data.csv')
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        resolved_data_folder = (
+            data_folder
+            if os.path.isabs(data_folder)
+            else os.path.join(app_dir, data_folder)
+        )
+        parquet_file = next(
+            (
+                os.path.join(resolved_data_folder, filename)
+                for filename in ('transactions.parquet', 'transactions_opt.parquet')
+                if os.path.exists(os.path.join(resolved_data_folder, filename))
+            ),
+            None,
+        )
+        csv_files = sorted(glob.glob(os.path.join(resolved_data_folder, '*.csv')))
+
+        if parquet_file is not None:
+            df = pd.read_parquet(parquet_file)
+        elif not csv_files:
+            data_csv = os.path.join(app_dir, 'data.csv')
+            if os.path.exists(data_csv):
+                df = pd.read_csv(data_csv)
             else:
-                raise FileNotFoundError("No transaction CSV files found in 'data/' folder or root directory.")
+                raise FileNotFoundError(
+                    "No transaction dataset found. Add 'data/transactions.parquet' "
+                    "or CSV files to the 'data/' folder."
+                )
         else:
             dfs = [pd.read_csv(f) for f in csv_files]
             df = pd.concat(dfs, ignore_index=True)
@@ -466,8 +487,19 @@ with st.sidebar:
         selected_date_range = None
         
     st.markdown("---")
-    file_count = len(glob.glob('data/*.csv'))
-    st.caption(f"⚡ **Platform Scale:** {file_count} CSV partitions &bull; {len(df_raw):,} records")
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    parquet_files = (
+        os.path.join(app_dir, 'data', 'transactions.parquet'),
+        os.path.join(app_dir, 'data', 'transactions_opt.parquet'),
+    )
+    if uploaded_file is not None:
+        dataset_source = "Uploaded CSV"
+    elif any(os.path.exists(path) for path in parquet_files):
+        dataset_source = "Prepared Parquet dataset"
+    else:
+        file_count = len(glob.glob(os.path.join(app_dir, 'data', '*.csv')))
+        dataset_source = f"{file_count} CSV partitions"
+    st.caption(f"⚡ **Platform Scale:** {dataset_source} &bull; {len(df_raw):,} records")
 
 # Apply Filters
 filtered_df = df_raw.copy()
