@@ -15,6 +15,7 @@ This project ingests multi-batch transaction datasets, calculates true turnaroun
 ## 🚀 Key Features
 
 * **Flexible Data Ingestion**: Loads `data/transactions.parquet` when available for faster startup, or automatically detects and consolidates partitioned CSV files in `data/` as a fallback.
+* **Transaction Type Filtering**: Filter the dashboard by transaction type and compare type-level volume, outcomes, transaction value, and successful turnaround latency.
 * **Granular Duration Banding**: Categorizes turnaround latency into user-defined operational brackets:
   * `1-5 seconds`
   * `6-10 seconds`
@@ -24,14 +25,15 @@ This project ingests multi-batch transaction datasets, calculates true turnaroun
   * `26-30 seconds`
   * `Above 30 seconds`
 * **Strict Resolution Separation**: In-flight `pending` records are tracked in isolation, ensuring completion velocity curves, success rates, and failure analyses exclusively reflect terminal outcomes (`success` vs `failed`).
-* **7 Comprehensive Analytics Views**:
+* **8 Comprehensive Analytics Views**:
   1. **Turnaround & SLA Overview**: Empirical Cumulative Distribution Function (CDF), P50/P75/P90 percentile thresholds, and SLA compliance metrics.
   2. **Duration Bands Deep Dive**: Volume distributions, success vs failure breakdowns, and 100% normalized resolution proportions per duration band.
   3. **Gateway Speed Ranking**: Fast-track vs bottleneck gateway leaderboards with average/median latency benchmarks and failure correlations.
   4. **Client & Merchant Analysis**: Transaction turnaround SLA, volume, and failure rates across 98 client accounts.
   5. **Daily Completion Trends**: Time-series tracking of transaction throughput, daily median latency shifts, and long-tail delay spikes.
   6. **Recon Action Impact**: Detailed statistical assessment (Min, Median, Mean, Max, Std Dev, and Count) of turnaround times across various reconciliation actions.
-  7. **Transaction Explorer & Latency Extrema**:
+  7. **Transaction Type Analysis**: Compares volume, success/failure outcomes, transaction value, and successful turnaround latency across transaction types.
+  8. **Transaction Explorer & Latency Extrema**:
      * **Top 100 Fastest Transactions**: Sub-millisecond to ~1.4 ms completions with 100% success rate.
      * **Top 100 Slowest Transactions**: Extreme latency outliers (4.2 days to 104.4 days) highlighting delayed reconciliation and gateway timeout sweeps.
      * **Custom Explorer**: Search by ID, sort by duration/amount, and export filtered extracts to CSV.

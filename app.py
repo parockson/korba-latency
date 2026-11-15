@@ -267,6 +267,7 @@ def load_and_preprocess_combined_data(data_folder='data'):
             'time_created',
             'transaction_status',
             'transaction_id',
+            'transaction_type',
             'response_code',
             'recon_action',
             'client_name',
@@ -282,6 +283,9 @@ def load_and_preprocess_combined_data(data_folder='data'):
         )
         if os.path.basename(parquet_file) == 'transactions.parquet':
             df['date_dt'] = df['time_created'].astype('timestamp[us, tz=UTC][pyarrow]')
+            df['transaction_type'] = categorical_with_default(
+                df['transaction_type'], 'Unknown Type'
+            )
             return df.drop(columns=['time_created'])
     elif csv_files:
         dfs = [pd.read_csv(f, dtype_backend="pyarrow") for f in csv_files]
@@ -325,6 +329,11 @@ def load_and_preprocess_combined_data(data_folder='data'):
         df['transaction_status'] = 'unknown'
     df['transaction_status'] = categorical_with_default(
         df['transaction_status'], 'unknown', lowercase=True
+    )
+    if 'transaction_type' not in df.columns:
+        df['transaction_type'] = 'Unknown Type'
+    df['transaction_type'] = categorical_with_default(
+        df['transaction_type'], 'Unknown Type'
     )
 
     # Reuse prepared duration fields to avoid rebuilding large columns at startup.
@@ -401,6 +410,7 @@ def load_and_preprocess_combined_data(data_folder='data'):
     df = df[
         [
             'transaction_status',
+            'transaction_type',
             'duration_band',
             'response_code',
             'client_name',
@@ -435,8 +445,17 @@ with st.sidebar:
         default=all_statuses,
         help="Select which transaction statuses to include in scope."
     )
+
+    # 2. Transaction Type
+    all_transaction_types = df_raw['transaction_type'].value_counts().index.tolist()
+    selected_transaction_types = st.multiselect(
+        "Transaction Type",
+        options=all_transaction_types,
+        default=all_transaction_types,
+        help="Filter the dashboard to selected transaction types."
+    )
     
-    # 2. Duration Bands
+    # 3. Duration Bands
     available_bands = [b for b in DURATION_BAND_ORDER if b in df_raw['duration_band'].unique()]
     col_b1, col_b2 = st.columns(2)
     with col_b1:
@@ -547,6 +566,12 @@ else:
     st.warning("⚠️ No status selected. Please choose at least one transaction status.")
     st.stop()
 
+if selected_transaction_types:
+    filter_mask &= df_raw['transaction_type'].isin(selected_transaction_types)
+else:
+    st.warning("⚠️ No transaction type selected. Please choose at least one transaction type.")
+    st.stop()
+
 if selected_bands:
     filter_mask &= df_raw['duration_band'].isin(selected_bands)
 else:
@@ -581,6 +606,10 @@ if selected_date_range and isinstance(selected_date_range, (tuple, list)) and le
 
 # CORE ARCHITECTURE: Strict Pending Status Separation
 filtered_df = df_raw if filter_mask.all() else df_raw.loc[filter_mask]
+if filtered_df.empty:
+    st.warning("No transactions match the selected filters.")
+    st.stop()
+
 completed_mask = filtered_df['transaction_status'].isin(['success', 'failed'])
 df_completed = filtered_df if completed_mask.all() else filtered_df.loc[completed_mask]
 pending_mask = filtered_df['transaction_status'] == 'pending'
@@ -716,6 +745,7 @@ selected_analytics_view = st.selectbox(
         "Client Analysis",
         "Daily Completion Trends",
         "Recon Action Impact",
+        "Transaction Type Analysis",
         "Transaction Explorer",
     ],
 )
@@ -1615,7 +1645,142 @@ if selected_analytics_view == 'Recon Action Impact':
 
 
 # ==============================================================================
-# TAB 7: TRANSACTION EXPLORER & DURATION EXTREMES FILTER
+# TRANSACTION TYPE ANALYSIS
+# ==============================================================================
+if selected_analytics_view == 'Transaction Type Analysis':
+    st.markdown("#### Transaction performance by type")
+    st.caption(
+        "Compare transaction volume, resolution outcomes, latency, and value by "
+        "transaction type. All results respect the active sidebar filters."
+    )
+
+    transaction_type_summary = filtered_df.groupby(
+        'transaction_type', observed=True
+    ).agg(
+        Transactions=('transaction_id', 'size'),
+        Success_Count=('transaction_status', lambda values: (values == 'success').sum()),
+        Failed_Count=('transaction_status', lambda values: (values == 'failed').sum()),
+        Median_Duration_s=('duration_seconds', 'median'),
+        Mean_Duration_s=('duration_seconds', 'mean'),
+        Amount_GHS=('debit_amt', 'sum'),
+    ).reset_index()
+    transaction_type_summary['Completed_Count'] = (
+        transaction_type_summary['Success_Count']
+        + transaction_type_summary['Failed_Count']
+    )
+    transaction_type_summary['Success_Rate_%'] = (
+        transaction_type_summary['Success_Count']
+        .div(transaction_type_summary['Completed_Count'].replace(0, np.nan))
+        .mul(100)
+    )
+    transaction_type_summary['Share_of_Total_%'] = (
+        transaction_type_summary['Transactions']
+        .div(transaction_type_summary['Transactions'].sum())
+        .mul(100)
+    )
+    transaction_type_summary = transaction_type_summary.sort_values(
+        'Transactions', ascending=False
+    ).reset_index(drop=True)
+
+    top_type = transaction_type_summary.iloc[0]
+    type_kpis = st.columns(4)
+    type_kpis[0].metric(
+        "Transaction types", f"{len(transaction_type_summary):,}"
+    )
+    type_kpis[1].metric(
+        "Transactions in scope", f"{int(transaction_type_summary['Transactions'].sum()):,}"
+    )
+    type_kpis[2].metric(
+        "Highest-volume type", str(top_type['transaction_type'])
+    )
+    type_kpis[3].metric(
+        "Top type share", f"{top_type['Share_of_Total_%']:.1f}%"
+    )
+
+    type_status = filtered_df.groupby(
+        ['transaction_type', 'transaction_status'], observed=True
+    ).size().reset_index(name='Transactions')
+    type_chart_col, latency_chart_col = st.columns(2)
+    with type_chart_col:
+        fig_type_volume = px.bar(
+            type_status,
+            x='Transactions',
+            y='transaction_type',
+            color='transaction_status',
+            barmode='stack',
+            orientation='h',
+            color_discrete_map=COLOR_MAP,
+            labels={
+                'Transactions': 'Transaction count',
+                'transaction_type': 'Transaction type',
+                'transaction_status': 'Status',
+            },
+            title="Transaction volume by type and status",
+        )
+        fig_type_volume.update_layout(
+            template=pio_template,
+            height=440,
+            yaxis=dict(autorange="reversed"),
+            margin=dict(t=40, b=20, l=10, r=10),
+        )
+        st.plotly_chart(fig_type_volume, use_container_width=True)
+
+    with latency_chart_col:
+        successful_type_latency = df_success.groupby(
+            'transaction_type', observed=True
+        ).agg(
+            Median_Duration_s=('duration_seconds', 'median'),
+        ).reset_index()
+        successful_type_latency = successful_type_latency.dropna(
+            subset=['Median_Duration_s']
+        ).sort_values('Median_Duration_s', ascending=False)
+        if not successful_type_latency.empty:
+            fig_type_latency = px.bar(
+                successful_type_latency,
+                x='Median_Duration_s',
+                y='transaction_type',
+                orientation='h',
+                labels={
+                    'Median_Duration_s': 'Median turnaround (seconds)',
+                    'transaction_type': 'Transaction type',
+                },
+                title="Median successful turnaround by type",
+                color='Median_Duration_s',
+                color_continuous_scale='Blues',
+            )
+            fig_type_latency.update_layout(
+                template=pio_template,
+                height=440,
+                yaxis=dict(autorange="reversed"),
+                margin=dict(t=40, b=20, l=10, r=10),
+            )
+            st.plotly_chart(fig_type_latency, use_container_width=True)
+        else:
+            st.info("No successful transactions with a logged duration in this selection.")
+
+    st.markdown("##### Transaction type metrics")
+    st.dataframe(
+        transaction_type_summary.rename(
+            columns={
+                'transaction_type': 'Transaction Type',
+                'Transactions': 'Transactions',
+                'Success_Count': 'Successful',
+                'Failed_Count': 'Failed',
+                'Completed_Count': 'Completed',
+                'Success_Rate_%': 'Success Rate (%)',
+                'Share_of_Total_%': 'Share of Total (%)',
+                'Median_Duration_s': 'Median Turnaround (s)',
+                'Mean_Duration_s': 'Mean Turnaround (s)',
+                'Amount_GHS': 'Total Amount (GHS)',
+            }
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+# ==============================================================================
+# TAB 8: TRANSACTION EXPLORER & DURATION EXTREMES FILTER
 # ==============================================================================
 if selected_analytics_view == 'Transaction Explorer':
     st.markdown("#### 🔍 Transaction Explorer & Latency Extrema Filters")
@@ -1729,7 +1894,7 @@ if selected_analytics_view == 'Transaction Explorer':
             if 'debit_amt' in display_least.columns:
                 display_least['Amount (GHS)'] = display_least['debit_amt'].apply(lambda x: f"GHS {x:,.2f}")
             
-            show_cols = [c for c in ['Rank', 'Turnaround (Readable)', 'Exact Seconds', 'transaction_status', 'transaction_id', 'client_name', 'response_code', 'recon_action', 'Amount (GHS)', 'date_str'] if c in display_least.columns]
+            show_cols = [c for c in ['Rank', 'Turnaround (Readable)', 'Exact Seconds', 'transaction_status', 'transaction_type', 'transaction_id', 'client_name', 'response_code', 'recon_action', 'Amount (GHS)', 'date_str'] if c in display_least.columns]
             
             col_search, col_dl = st.columns([3, 1])
             with col_search:
@@ -1753,7 +1918,7 @@ if selected_analytics_view == 'Transaction Explorer':
             # Mini chart for fastest transactions
             st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
             top_chart_least = top100_least.head(25).copy()
-            top_chart_least['Client_Tx'] = top_chart_least['client_name'].str.slice(0, 15) + ' (' + top_chart_least['transaction_id'].astype(str).str[-6:] + ')'
+            top_chart_least['Client_Tx'] = top_chart_least['client_name'].astype('string[pyarrow]').str.slice(0, 15) + ' (' + top_chart_least['transaction_id'].astype('string[pyarrow]').str.slice(-6) + ')'
             top_chart_least['Duration_ms'] = top_chart_least['duration_seconds'] * 1000.0
             
             fig_least = px.bar(
@@ -1852,7 +2017,7 @@ if selected_analytics_view == 'Transaction Explorer':
             if 'debit_amt' in display_highest.columns:
                 display_highest['Amount (GHS)'] = display_highest['debit_amt'].apply(lambda x: f"GHS {x:,.2f}")
             
-            show_cols = [c for c in ['Rank', 'Turnaround (Readable)', 'Duration (Days)', 'Duration (Hours)', 'transaction_status', 'transaction_id', 'client_name', 'response_code', 'recon_action', 'Amount (GHS)', 'date_str'] if c in display_highest.columns]
+            show_cols = [c for c in ['Rank', 'Turnaround (Readable)', 'Duration (Days)', 'Duration (Hours)', 'transaction_status', 'transaction_type', 'transaction_id', 'client_name', 'response_code', 'recon_action', 'Amount (GHS)', 'date_str'] if c in display_highest.columns]
             
             col_search, col_dl = st.columns([3, 1])
             with col_search:
@@ -1877,7 +2042,7 @@ if selected_analytics_view == 'Transaction Explorer':
             st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
             chart_slow = top100_highest.head(20).copy()
             chart_slow['Days'] = chart_slow['duration_seconds'] / 86400.0
-            chart_slow['Client_Tx'] = chart_slow['client_name'].str.slice(0, 15) + ' (' + chart_slow['transaction_id'].astype(str).str[-6:] + ') - ' + chart_slow['transaction_status'].str.upper()
+            chart_slow['Client_Tx'] = chart_slow['client_name'].astype('string[pyarrow]').str.slice(0, 15) + ' (' + chart_slow['transaction_id'].astype('string[pyarrow]').str.slice(-6) + ') - ' + chart_slow['transaction_status'].astype('string[pyarrow]').str.upper()
             
             fig_slow = px.bar(
                 chart_slow,
@@ -1916,7 +2081,7 @@ if selected_analytics_view == 'Transaction Explorer':
         with col_exp3:
             rows_to_display = st.selectbox("Rows to display:", options=[50, 100, 250, 500, 1000], index=1)
             
-        cols_export = [c for c in ['date_str', 'transaction_id', 'transaction_status', 'duration_seconds', 'duration_band', 'recon_action', 'response_code', 'client_name', 'debit_amt'] if c in source_df.columns]
+        cols_export = [c for c in ['date_str', 'transaction_id', 'transaction_status', 'transaction_type', 'duration_seconds', 'duration_band', 'recon_action', 'response_code', 'client_name', 'debit_amt'] if c in source_df.columns]
         display_df = source_df[cols_export].copy()
         
         # Apply sorting
