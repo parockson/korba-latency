@@ -729,21 +729,24 @@ with k6:
 
 st.markdown("<div style='height: 14px;'></div>", unsafe_allow_html=True)
 
-# Dashboard Tabs (WITH DEDICATED RECON ACTION IMPACT ANALYSIS)
-tab_overview, tab_duration, tab_speed_leaderboard, tab_client, tab_trends, tab_recon, tab_explorer = st.tabs([
-    "🚀 Turnaround & SLA Overview",
-    "⏱️ Duration Bands Deep Dive",
-    "⚡ Gateway Speed Ranking",
-    "🏢 Client Analysis",
-    "📈 Daily Completion Trends",
-    "🔄 Recon Action Impact",
-    "🔍 Transaction Explorer"
-])
+# Choose one analytics view at a time to keep memory use within hosted limits.
+selected_analytics_view = st.selectbox(
+    "Analytics view",
+    [
+        "Turnaround & SLA Overview",
+        "Duration Bands Deep Dive",
+        "Gateway Speed Ranking",
+        "Client Analysis",
+        "Daily Completion Trends",
+        "Recon Action Impact",
+        "Transaction Explorer",
+    ],
+)
 
 # ==============================================================================
 # TAB 1: TURNAROUND & SLA OVERVIEW
 # ==============================================================================
-with tab_overview:
+if selected_analytics_view == 'Turnaround & SLA Overview':
     st.markdown("#### 🎯 How Long Do Transactions Take to Complete?")
     st.caption("Visualizing completion velocity curves, turnaround SLA compliance, and latency brackets.")
     
@@ -890,7 +893,7 @@ with tab_overview:
 # ==============================================================================
 # TAB 2: DURATION BANDS DEEP DIVE
 # ==============================================================================
-with tab_duration:
+if selected_analytics_view == 'Duration Bands Deep Dive':
     st.markdown("#### ⏱️ Granular Breakdown across Duration Bands")
     st.caption("Distribution of transactions across configured duration brackets.")
     
@@ -1004,7 +1007,7 @@ with tab_duration:
 # ==============================================================================
 # TAB 3: GATEWAY SPEED RANKING
 # ==============================================================================
-with tab_speed_leaderboard:
+if selected_analytics_view == 'Gateway Speed Ranking':
     st.markdown("#### ⚡ Gateway & Response Code Speed Leaderboard")
     st.caption("How long does each provider / response code take to complete successful transactions? Ranked from fastest to slowest.")
     
@@ -1074,7 +1077,7 @@ with tab_speed_leaderboard:
 # ==============================================================================
 # TAB 4: CLIENT & MERCHANT ANALYSIS
 # ==============================================================================
-with tab_client:
+if selected_analytics_view == 'Client Analysis':
     st.markdown("#### 🏢 Client & Merchant Performance Analytics")
     st.caption("Deep-dive into client transaction volume, turnover value, turnaround latency, and success rates.")
     
@@ -1310,7 +1313,7 @@ with tab_client:
 # ==============================================================================
 # TAB 5: DAILY COMPLETION TRENDS
 # ==============================================================================
-with tab_trends:
+if selected_analytics_view == 'Daily Completion Trends':
     st.markdown("#### 📈 How Has Completion Speed Trended Over Time?")
     st.caption("Tracking daily turnaround times to detect latency degradations or network slowdowns.")
     
@@ -1379,7 +1382,7 @@ with tab_trends:
 # ==============================================================================
 # TAB 6: RECON ACTION IMPACT & LATENCY ANALYSIS (NEW)
 # ==============================================================================
-with tab_recon:
+if selected_analytics_view == 'Recon Action Impact':
     st.markdown("#### 🔄 Effect of Reconciliation (Recon Actions) on Duration")
     st.caption("Quantitative impact analysis: How reconciliation workflows change transaction duration from seconds to hours or days.")
     
@@ -1637,7 +1640,7 @@ with tab_recon:
 # ==============================================================================
 # TAB 7: TRANSACTION EXPLORER & DURATION EXTREMES FILTER
 # ==============================================================================
-with tab_explorer:
+if selected_analytics_view == 'Transaction Explorer':
     st.markdown("#### 🔍 Transaction Explorer & Latency Extrema Filters")
     st.caption("Inspect individual transaction records, filter by fastest/slowest turnaround records, or search by transaction ID.")
     
