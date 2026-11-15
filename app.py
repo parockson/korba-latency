@@ -241,60 +241,56 @@ def categorical_with_default(series, default, lowercase=False):
     show_spinner="Consolidating data files and computing latency...",
     max_entries=2,
 )
-def load_and_preprocess_combined_data(data_folder='data', single_file=None, inject_demo_pending=False):
+def load_and_preprocess_combined_data(data_folder='data'):
     """
     Loads the prepared dataset when available, otherwise combines CSV parts,
     standardizes schemas, calculates duration from timestamps, and handles Recon Actions.
     """
-    if single_file is not None:
-        df = pd.read_csv(single_file, dtype_backend="pyarrow")
-    else:
-        app_dir = os.path.dirname(os.path.abspath(__file__))
-        resolved_data_folder = (
-            data_folder
-            if os.path.isabs(data_folder)
-            else os.path.join(app_dir, data_folder)
-        )
-        parquet_file = next(
-            (
-                os.path.join(resolved_data_folder, filename)
-                for filename in ('transactions.parquet', 'transactions_opt.parquet')
-                if os.path.exists(os.path.join(resolved_data_folder, filename))
-            ),
-            None,
-        )
-        csv_files = sorted(glob.glob(os.path.join(resolved_data_folder, '*.csv')))
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    resolved_data_folder = (
+        data_folder
+        if os.path.isabs(data_folder)
+        else os.path.join(app_dir, data_folder)
+    )
+    parquet_file = next(
+        (
+            os.path.join(resolved_data_folder, filename)
+            for filename in ('transactions.parquet', 'transactions_opt.parquet')
+            if os.path.exists(os.path.join(resolved_data_folder, filename))
+        ),
+        None,
+    )
+    csv_files = sorted(glob.glob(os.path.join(resolved_data_folder, '*.csv')))
 
-        if parquet_file is not None:
-            parquet_columns = [
-                'time_created',
-                'transaction_status',
-                'transaction_id',
-                'response_code',
-                'recon_action',
-                'client_name',
-                'debit_amt',
-                'duration_seconds',
-                'date_str',
-                'duration_band',
-            ] if os.path.basename(parquet_file) == 'transactions.parquet' else None
-            df = pd.read_parquet(
-                parquet_file,
-                columns=parquet_columns,
-                dtype_backend="pyarrow",
-            )
-        elif not csv_files:
-            data_csv = os.path.join(app_dir, 'data.csv')
-            if os.path.exists(data_csv):
-                df = pd.read_csv(data_csv, dtype_backend="pyarrow")
-            else:
-                raise FileNotFoundError(
-                    "No transaction dataset found. Add 'data/transactions.parquet' "
-                    "or CSV files to the 'data/' folder."
-                )
-        else:
-            dfs = [pd.read_csv(f, dtype_backend="pyarrow") for f in csv_files]
-            df = pd.concat(dfs, ignore_index=True)
+    if parquet_file is not None:
+        parquet_columns = [
+            'time_created',
+            'transaction_status',
+            'transaction_id',
+            'response_code',
+            'recon_action',
+            'client_name',
+            'debit_amt',
+            'duration_seconds',
+            'date_str',
+            'duration_band',
+        ] if os.path.basename(parquet_file) == 'transactions.parquet' else None
+        df = pd.read_parquet(
+            parquet_file,
+            columns=parquet_columns,
+            dtype_backend="pyarrow",
+        )
+        if os.path.basename(parquet_file) == 'transactions.parquet':
+            df['date_dt'] = df['time_created'].astype('timestamp[us, tz=UTC][pyarrow]')
+            return df.drop(columns=['time_created'])
+    elif csv_files:
+        dfs = [pd.read_csv(f, dtype_backend="pyarrow") for f in csv_files]
+        df = pd.concat(dfs, ignore_index=True)
+    else:
+        raise FileNotFoundError(
+            "No transaction dataset found. Add the bundled Parquet file "
+            "or CSV partitions to the 'data/' folder."
+        )
     
     # Standardize column mapping safely
     col_map = {}
@@ -417,32 +413,13 @@ def load_and_preprocess_combined_data(data_folder='data', single_file=None, inje
         ]
     ]
 
-    if inject_demo_pending:
-        np.random.seed(42)
-        if 'pending' not in df['transaction_status'].cat.categories:
-            df['transaction_status'] = df['transaction_status'].cat.add_categories(['pending'])
-        sample_pending_idx = df.sample(frac=0.015, random_state=42).index
-        df.loc[sample_pending_idx, 'transaction_status'] = 'pending'
-        
     return df
 
 # Sidebar Navigation and Controls
 with st.sidebar:
     st.markdown("### ⚙️ Dashboard Controls")
-    uploaded_file = st.file_uploader("📂 Upload Custom CSV Batch", type=['csv'])
-    
-    demo_pending_toggle = st.toggle(
-        "⚡ Inject Demo 'Pending' status", 
-        value=False,
-        help="Simulates 1.5% in-flight pending status to verify queue isolation behavior."
-    )
-    
     try:
-        if uploaded_file is not None:
-            df_raw = load_and_preprocess_combined_data(single_file=uploaded_file, inject_demo_pending=demo_pending_toggle)
-            st.success("Uploaded file loaded successfully!")
-        else:
-            df_raw = load_and_preprocess_combined_data(data_folder='data', inject_demo_pending=demo_pending_toggle)
+        df_raw = load_and_preprocess_combined_data(data_folder='data')
     except Exception as e:
         st.error(f"Error loading dataset: {e}")
         st.stop()
@@ -556,9 +533,7 @@ with st.sidebar:
         os.path.join(app_dir, 'data', 'transactions.parquet'),
         os.path.join(app_dir, 'data', 'transactions_opt.parquet'),
     )
-    if uploaded_file is not None:
-        dataset_source = "Uploaded CSV"
-    elif any(os.path.exists(path) for path in parquet_files):
+    if any(os.path.exists(path) for path in parquet_files):
         dataset_source = "Prepared Parquet dataset"
     else:
         file_count = len(glob.glob(os.path.join(app_dir, 'data', '*.csv')))
@@ -605,9 +580,11 @@ if selected_date_range and isinstance(selected_date_range, (tuple, list)) and le
     filter_mask &= date_mask | dates_series.isna()
 
 # CORE ARCHITECTURE: Strict Pending Status Separation
-filtered_df = df_raw.loc[filter_mask]
-df_completed = filtered_df[filtered_df['transaction_status'].isin(['success', 'failed'])]
-df_pending = filtered_df[filtered_df['transaction_status'] == 'pending']
+filtered_df = df_raw if filter_mask.all() else df_raw.loc[filter_mask]
+completed_mask = filtered_df['transaction_status'].isin(['success', 'failed'])
+df_completed = filtered_df if completed_mask.all() else filtered_df.loc[completed_mask]
+pending_mask = filtered_df['transaction_status'] == 'pending'
+df_pending = filtered_df.loc[pending_mask] if pending_mask.any() else filtered_df.iloc[:0]
 
 total_all = len(filtered_df)
 total_completed = len(df_completed)
