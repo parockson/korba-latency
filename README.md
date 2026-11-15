@@ -16,6 +16,7 @@ This project ingests multi-batch transaction datasets, calculates true turnaroun
 
 * **Flexible Data Ingestion**: Loads `data/transactions.parquet` when available for faster startup, or automatically detects and consolidates partitioned CSV files in `data/` as a fallback.
 * **Transaction Type Filtering**: Filter the dashboard by transaction type and compare type-level volume, outcomes, transaction value, and successful turnaround latency.
+* **Excluded Transaction Types**: The bundled datasets omit transactions whose type contains `OVA_TRANSFER` or `bulk` (case-insensitive).
 * **Granular Duration Banding**: Categorizes turnaround latency into user-defined operational brackets:
   * `1-5 seconds`
   * `6-10 seconds`
