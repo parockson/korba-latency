@@ -220,14 +220,34 @@ def format_duration_friendly(seconds):
         days = sec / 86400.0
         return f"{days:.1f} days ({sec/3600:,.0f} hrs)"
 
-@st.cache_data(show_spinner="Consolidating data files and computing latency...")
+def categorical_with_default(series, default, lowercase=False):
+    series = series.astype("category")
+    categories = [
+        str(value).strip().lower() if lowercase else str(value)
+        for value in series.cat.categories
+    ]
+    if len(set(categories)) != len(categories):
+        series = series.astype("string[pyarrow]")
+        if lowercase:
+            series = series.str.strip().str.lower()
+        return series.fillna(default).astype("category")
+    series = series.cat.rename_categories(categories)
+    if default not in series.cat.categories:
+        series = series.cat.add_categories([default])
+    return series.fillna(default)
+
+
+@st.cache_resource(
+    show_spinner="Consolidating data files and computing latency...",
+    max_entries=2,
+)
 def load_and_preprocess_combined_data(data_folder='data', single_file=None, inject_demo_pending=False):
     """
     Loads the prepared dataset when available, otherwise combines CSV parts,
     standardizes schemas, calculates duration from timestamps, and handles Recon Actions.
     """
     if single_file is not None:
-        df = pd.read_csv(single_file)
+        df = pd.read_csv(single_file, dtype_backend="pyarrow")
     else:
         app_dir = os.path.dirname(os.path.abspath(__file__))
         resolved_data_folder = (
@@ -246,18 +266,34 @@ def load_and_preprocess_combined_data(data_folder='data', single_file=None, inje
         csv_files = sorted(glob.glob(os.path.join(resolved_data_folder, '*.csv')))
 
         if parquet_file is not None:
-            df = pd.read_parquet(parquet_file)
+            parquet_columns = [
+                'time_created',
+                'transaction_status',
+                'transaction_id',
+                'response_code',
+                'recon_action',
+                'client_name',
+                'debit_amt',
+                'duration_seconds',
+                'date_str',
+                'duration_band',
+            ] if os.path.basename(parquet_file) == 'transactions.parquet' else None
+            df = pd.read_parquet(
+                parquet_file,
+                columns=parquet_columns,
+                dtype_backend="pyarrow",
+            )
         elif not csv_files:
             data_csv = os.path.join(app_dir, 'data.csv')
             if os.path.exists(data_csv):
-                df = pd.read_csv(data_csv)
+                df = pd.read_csv(data_csv, dtype_backend="pyarrow")
             else:
                 raise FileNotFoundError(
                     "No transaction dataset found. Add 'data/transactions.parquet' "
                     "or CSV files to the 'data/' folder."
                 )
         else:
-            dfs = [pd.read_csv(f) for f in csv_files]
+            dfs = [pd.read_csv(f, dtype_backend="pyarrow") for f in csv_files]
             df = pd.concat(dfs, ignore_index=True)
     
     # Standardize column mapping safely
@@ -289,74 +325,102 @@ def load_and_preprocess_combined_data(data_folder='data', single_file=None, inje
     df = df.loc[:, ~df.columns.duplicated()]
     
     # Clean transaction_status
-    if 'transaction_status' in df.columns:
-        df['transaction_status'] = df['transaction_status'].astype(str).str.strip().str.lower()
-    else:
+    if 'transaction_status' not in df.columns:
         df['transaction_status'] = 'unknown'
+    df['transaction_status'] = categorical_with_default(
+        df['transaction_status'], 'unknown', lowercase=True
+    )
 
-    # Manual Duration Calculation
-    if 'time_created' in df.columns and 'time_completed' in df.columns:
+    # Reuse prepared duration fields to avoid rebuilding large columns at startup.
+    if 'duration_seconds' not in df.columns and 'time_created' in df.columns and 'time_completed' in df.columns:
         tc = pd.to_datetime(df['time_created'], format='ISO8601', errors='coerce')
         tcomp = pd.to_datetime(df['time_completed'], format='ISO8601', errors='coerce')
         df['duration_seconds'] = (tcomp - tc).dt.total_seconds().abs()
         df['date_dt'] = tc
-        df['date_str'] = tc.dt.strftime('%Y-%m-%d').fillna('Unknown Date')
     elif 'duration_seconds' in df.columns:
         df['duration_seconds'] = pd.to_numeric(df['duration_seconds'], errors='coerce').abs()
-        if 'date' in df.columns:
-            df['date_dt'] = pd.to_datetime(df['date'], errors='coerce')
-            df['date_str'] = df['date_dt'].dt.strftime('%Y-%m-%d').fillna('Unknown Date')
-        else:
-            df['date_dt'] = pd.NaT
-            df['date_str'] = 'Unknown Date'
     else:
         df['duration_seconds'] = np.nan
-        df['date_dt'] = pd.NaT
-        df['date_str'] = 'Unknown Date'
+
+    if 'date_dt' not in df.columns:
+        if 'time_created' in df.columns:
+            df['date_dt'] = pd.to_datetime(df['time_created'], format='ISO8601', errors='coerce')
+        elif 'date' in df.columns:
+            df['date_dt'] = pd.to_datetime(df['date'], errors='coerce')
+        else:
+            df['date_dt'] = pd.NaT
+    if 'date_str' not in df.columns:
+        df['date_str'] = df['date_dt'].dt.strftime('%Y-%m-%d').fillna('Unknown Date')
+    else:
+        df['date_str'] = df['date_str'].fillna('Unknown Date').astype('string[pyarrow]')
         
     # Bin into duration bands
-    df['duration_band'] = pd.cut(
-        df['duration_seconds'],
-        bins=[0, 5, 10, 15, 20, 25, 30, np.inf],
-        labels=[
-            '1-5 seconds',
-            '6-10 seconds',
-            '11-15 seconds',
-            '16-20 seconds',
-            '21-25 seconds',
-            '26-30 seconds',
-            'Above 30 seconds'
-        ],
-        include_lowest=True
-    )
-    df['duration_band'] = df['duration_band'].astype(str).replace({'nan': 'Not Logged'})
+    if 'duration_band' not in df.columns:
+        df['duration_band'] = pd.cut(
+            df['duration_seconds'],
+            bins=[0, 5, 10, 15, 20, 25, 30, np.inf],
+            labels=[
+                '1-5 seconds',
+                '6-10 seconds',
+                '11-15 seconds',
+                '16-20 seconds',
+                '21-25 seconds',
+                '26-30 seconds',
+                'Above 30 seconds'
+            ],
+            include_lowest=True
+        )
+    df['duration_band'] = categorical_with_default(df['duration_band'], 'Not Logged')
     
     # Clean string identifiers
-    df['response_code'] = df['response_code'].fillna('UNKNOWN').astype(str) if 'response_code' in df.columns else 'UNKNOWN'
+    if 'response_code' not in df.columns:
+        df['response_code'] = 'UNKNOWN'
+    df['response_code'] = categorical_with_default(df['response_code'], 'UNKNOWN')
     
     if 'client_name' in df.columns:
         if isinstance(df['client_name'], pd.DataFrame):
             df['client_name'] = df['client_name'].iloc[:, 0]
-        df['client_name'] = df['client_name'].fillna('Unknown Client').astype(str)
     else:
         df['client_name'] = 'Unknown Client'
+    df['client_name'] = categorical_with_default(df['client_name'], 'Unknown Client')
         
     if 'recon_action' in df.columns:
         if isinstance(df['recon_action'], pd.DataFrame):
             df['recon_action'] = df['recon_action'].iloc[:, 0]
-        df['recon_action'] = df['recon_action'].fillna('Direct Settlement (No Recon)').astype(str)
     else:
         df['recon_action'] = 'Direct Settlement (No Recon)'
+    df['recon_action'] = categorical_with_default(
+        df['recon_action'], 'Direct Settlement (No Recon)'
+    )
         
-    df['transaction_id'] = df['transaction_id'].fillna('N/A').astype(str) if 'transaction_id' in df.columns else 'N/A'
+    if 'transaction_id' not in df.columns:
+        df['transaction_id'] = 'N/A'
+    df['transaction_id'] = df['transaction_id'].fillna('N/A').astype('string[pyarrow]')
     
     if 'debit_amt' in df.columns:
         df['debit_amt'] = pd.to_numeric(df['debit_amt'], errors='coerce').fillna(0.0)
     else:
         df['debit_amt'] = 0.0
 
+    df = df[
+        [
+            'transaction_status',
+            'duration_band',
+            'response_code',
+            'client_name',
+            'recon_action',
+            'date_dt',
+            'date_str',
+            'transaction_id',
+            'debit_amt',
+            'duration_seconds',
+        ]
+    ]
+
     if inject_demo_pending:
         np.random.seed(42)
+        if 'pending' not in df['transaction_status'].cat.categories:
+            df['transaction_status'] = df['transaction_status'].cat.add_categories(['pending'])
         sample_pending_idx = df.sample(frac=0.015, random_state=42).index
         df.loc[sample_pending_idx, 'transaction_status'] = 'pending'
         
@@ -501,45 +565,49 @@ with st.sidebar:
         dataset_source = f"{file_count} CSV partitions"
     st.caption(f"⚡ **Platform Scale:** {dataset_source} &bull; {len(df_raw):,} records")
 
-# Apply Filters
-filtered_df = df_raw.copy()
-
+# Apply filters with a single row selection to avoid repeated full-dataframe copies.
 if selected_statuses:
-    filtered_df = filtered_df[filtered_df['transaction_status'].isin(selected_statuses)]
+    filter_mask = df_raw['transaction_status'].isin(selected_statuses)
 else:
     st.warning("⚠️ No status selected. Please choose at least one transaction status.")
     st.stop()
 
 if selected_bands:
-    filtered_df = filtered_df[filtered_df['duration_band'].isin(selected_bands)]
+    filter_mask &= df_raw['duration_band'].isin(selected_bands)
 else:
     st.warning("⚠️ No duration band selected. Please select at least one band.")
     st.stop()
 
 if selected_codes:
-    filtered_df = filtered_df[filtered_df['response_code'].isin(selected_codes)]
+    filter_mask &= df_raw['response_code'].isin(selected_codes)
 else:
     st.warning("⚠️ No response code selected. Please select at least one code.")
     st.stop()
 
 if selected_recons:
-    filtered_df = filtered_df[filtered_df['recon_action'].isin(selected_recons)]
+    filter_mask &= df_raw['recon_action'].isin(selected_recons)
 else:
     st.warning("⚠️ No recon action selected. Please select at least one recon action.")
     st.stop()
 
 if selected_client != "All Clients":
-    filtered_df = filtered_df[filtered_df['client_name'] == selected_client]
+    filter_mask &= df_raw['client_name'] == selected_client
 
 if selected_date_range and isinstance(selected_date_range, (tuple, list)) and len(selected_date_range) == 2:
     start_d, end_d = selected_date_range
-    dates_series = filtered_df['date_dt']
-    date_mask = (dates_series.dt.date >= start_d) & (dates_series.dt.date <= end_d)
-    filtered_df = filtered_df[date_mask.fillna(False) | dates_series.isna()]
+    dates_series = df_raw['date_dt']
+    start_ts = pd.Timestamp(start_d)
+    end_ts = pd.Timestamp(end_d) + pd.Timedelta(days=1)
+    if dates_series.dt.tz is not None:
+        start_ts = start_ts.tz_localize(dates_series.dt.tz)
+        end_ts = end_ts.tz_localize(dates_series.dt.tz)
+    date_mask = dates_series.ge(start_ts) & dates_series.lt(end_ts)
+    filter_mask &= date_mask | dates_series.isna()
 
 # CORE ARCHITECTURE: Strict Pending Status Separation
-df_completed = filtered_df[filtered_df['transaction_status'].isin(['success', 'failed'])].copy()
-df_pending = filtered_df[filtered_df['transaction_status'] == 'pending'].copy()
+filtered_df = df_raw.loc[filter_mask]
+df_completed = filtered_df[filtered_df['transaction_status'].isin(['success', 'failed'])]
+df_pending = filtered_df[filtered_df['transaction_status'] == 'pending']
 
 total_all = len(filtered_df)
 total_completed = len(df_completed)
