@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import plotly.express as px
 import plotly.graph_objects as go
 import glob
@@ -266,6 +268,74 @@ def get_dataset_fingerprint(data_folder='data'):
     return tuple(fingerprint)
 
 
+@st.cache_resource(max_entries=1)
+def load_transaction_ids(data_folder='data', dataset_fingerprint=None, row_indices=None):
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    resolved_data_folder = (
+        data_folder
+        if os.path.isabs(data_folder)
+        else os.path.join(app_dir, data_folder)
+    )
+    parquet_file = next(
+        (
+            os.path.join(resolved_data_folder, filename)
+            for filename in ('transactions.parquet', 'transactions_opt.parquet')
+            if os.path.exists(os.path.join(resolved_data_folder, filename))
+        ),
+        None,
+    )
+    if parquet_file is None:
+        raise FileNotFoundError("Transaction IDs are only loaded separately from Parquet.")
+    parquet_reader = pq.ParquetFile(parquet_file)
+    if row_indices is None:
+        table = parquet_reader.read(columns=['transaction_id'])
+        transaction_ids = table.column('transaction_id').to_pandas(
+            types_mapper=pd.ArrowDtype
+        )
+        del table
+    else:
+        indices = pd.Index(row_indices).astype('int64')
+        if indices.empty:
+            return pd.Series([], index=indices, dtype='string[pyarrow]')
+
+        row_group_offsets = np.cumsum(
+            [0] + [
+                parquet_reader.metadata.row_group(group).num_rows
+                for group in range(parquet_reader.num_row_groups)
+            ]
+        )
+        if indices.min() < 0 or indices.max() >= row_group_offsets[-1]:
+            raise IndexError("Transaction row index is outside the Parquet dataset.")
+
+        unique_indices = indices.unique()
+        group_numbers = np.searchsorted(
+            row_group_offsets[1:], unique_indices.to_numpy(), side='right'
+        )
+        id_parts = []
+        for group_number in np.unique(group_numbers):
+            part_positions = np.flatnonzero(group_numbers == group_number)
+            part_indices = unique_indices.take(part_positions)
+            group_ids = parquet_reader.read_row_group(
+                int(group_number), columns=['transaction_id']
+            ).column('transaction_id')
+            local_positions = (
+                part_indices.to_numpy() - row_group_offsets[group_number]
+            )
+            selected_ids = group_ids.take(pa.array(local_positions)).to_pandas(
+                types_mapper=pd.ArrowDtype
+            )
+            if selected_ids.isna().any():
+                selected_ids = selected_ids.fillna('N/A')
+            id_parts.append(pd.Series(selected_ids.array, index=part_indices))
+
+        transaction_ids = pd.concat(id_parts).reindex(indices.unique()).reindex(indices)
+        return transaction_ids
+
+    if transaction_ids.isna().any():
+        transaction_ids = transaction_ids.fillna('N/A')
+    return transaction_ids
+
+
 @st.cache_resource(
     show_spinner="Consolidating data files and computing latency...",
     max_entries=2,
@@ -294,9 +364,7 @@ def load_and_preprocess_combined_data(data_folder='data', dataset_fingerprint=No
 
     if parquet_file is not None:
         parquet_columns = [
-            'time_created',
             'transaction_status',
-            'transaction_id',
             'transaction_type',
             'response_code',
             'recon_action',
@@ -306,13 +374,22 @@ def load_and_preprocess_combined_data(data_folder='data', dataset_fingerprint=No
             'date_str',
             'duration_band',
         ]
-        df = pd.read_parquet(
+        dictionary_columns = [
+            'transaction_status',
+            'transaction_type',
+            'response_code',
+            'recon_action',
+            'client_name',
+            'date_str',
+            'duration_band',
+        ]
+        table = pq.read_table(
             parquet_file,
             columns=parquet_columns,
-            dtype_backend="pyarrow",
+            read_dictionary=dictionary_columns,
         )
-        # time_created is stored as timestamp[us, tz=UTC] — use it as date_dt directly
-        df['date_dt'] = df['time_created']
+        df = table.to_pandas(types_mapper=pd.ArrowDtype)
+        del table
         df['transaction_status'] = categorical_with_default(
             df['transaction_status'], 'unknown', lowercase=True
         )
@@ -322,10 +399,17 @@ def load_and_preprocess_combined_data(data_folder='data', dataset_fingerprint=No
         for col in ['response_code', 'recon_action', 'client_name', 'duration_band']:
             if col in df.columns:
                 df[col] = df[col].astype('category')
-        df['transaction_id'] = df['transaction_id'].fillna('N/A').astype('string[pyarrow]')
-        df['debit_amt'] = pd.to_numeric(df['debit_amt'], errors='coerce').fillna(0.0)
+        df['date_str'] = categorical_with_default(df['date_str'], 'Unknown Date')
+        df['date_str'] = df['date_str'].cat.reorder_categories(
+            sorted(df['date_str'].cat.categories),
+            ordered=True,
+        )
+        if df['debit_amt'].isna().any():
+            df['debit_amt'] = pd.to_numeric(
+                df['debit_amt'], errors='coerce'
+            ).fillna(0.0)
         df['duration_seconds'] = pd.to_numeric(df['duration_seconds'], errors='coerce').abs()
-        return df.drop(columns=['time_created'])
+        return df
     elif csv_files:
         dfs = [pd.read_csv(f, dtype_backend="pyarrow") for f in csv_files]
         df = pd.concat(dfs, ignore_index=True)
@@ -397,6 +481,11 @@ def load_and_preprocess_combined_data(data_folder='data', dataset_fingerprint=No
         df['date_str'] = df['date_dt'].dt.strftime('%Y-%m-%d').fillna('Unknown Date')
     else:
         df['date_str'] = df['date_str'].fillna('Unknown Date').astype('string[pyarrow]')
+    df['date_str'] = categorical_with_default(df['date_str'], 'Unknown Date')
+    df['date_str'] = df['date_str'].cat.reorder_categories(
+        sorted(df['date_str'].cat.categories),
+        ordered=True,
+    )
         
     # Bin into duration bands
     if 'duration_band' not in df.columns:
@@ -454,7 +543,6 @@ def load_and_preprocess_combined_data(data_folder='data', dataset_fingerprint=No
             'response_code',
             'client_name',
             'recon_action',
-            'date_dt',
             'date_str',
             'transaction_id',
             'debit_amt',
@@ -510,6 +598,12 @@ with st.sidebar:
             
     if 'selected_bands' not in st.session_state:
         st.session_state['selected_bands'] = available_bands
+    else:
+        saved_bands = st.session_state['selected_bands']
+        valid_bands = [band for band in saved_bands if band in available_bands]
+        if saved_bands and not valid_bands:
+            valid_bands = available_bands
+        st.session_state['selected_bands'] = valid_bands
         
     selected_bands = st.multiselect(
         "Duration Bands",
@@ -530,6 +624,12 @@ with st.sidebar:
             
     if 'selected_codes' not in st.session_state:
         st.session_state['selected_codes'] = top_rc_list
+    else:
+        saved_codes = st.session_state['selected_codes']
+        valid_codes = [code for code in saved_codes if code in top_rc_list]
+        if saved_codes and not valid_codes:
+            valid_codes = top_rc_list
+        st.session_state['selected_codes'] = valid_codes
         
     selected_codes = st.multiselect(
         "Response Codes",
@@ -550,6 +650,12 @@ with st.sidebar:
             
     if 'selected_recons' not in st.session_state:
         st.session_state['selected_recons'] = all_recons
+    else:
+        saved_recons = st.session_state['selected_recons']
+        valid_recons = [action for action in saved_recons if action in all_recons]
+        if saved_recons and not valid_recons:
+            valid_recons = all_recons
+        st.session_state['selected_recons'] = valid_recons
         
     selected_recons = st.multiselect(
         "Recon Action Filter",
@@ -575,10 +681,19 @@ with st.sidebar:
     )
 
     # 6. Date Range Filter
-    valid_dates = df_raw['date_dt'].dropna()
+    valid_date_values = [
+        value
+        for value in df_raw['date_str'].cat.categories
+        if value != 'Unknown Date'
+    ]
+    valid_dates = pd.to_datetime(
+        valid_date_values,
+        format='%Y-%m-%d',
+        errors='coerce',
+    ).dropna()
     if not valid_dates.empty:
-        min_date = valid_dates.min().date() if hasattr(valid_dates.min(), 'date') else valid_dates.min()
-        max_date = valid_dates.max().date() if hasattr(valid_dates.max(), 'date') else valid_dates.max()
+        min_date = valid_dates.min().date()
+        max_date = valid_dates.max().date()
         selected_date_range = st.date_input(
             "Date Range",
             value=(min_date, max_date),
@@ -638,20 +753,23 @@ if selected_client != "All Clients":
 
 if selected_date_range and isinstance(selected_date_range, (tuple, list)) and len(selected_date_range) == 2:
     start_d, end_d = selected_date_range
-    dates_series = df_raw['date_dt']
-    start_ts = pd.Timestamp(start_d)
-    end_ts = pd.Timestamp(end_d) + pd.Timedelta(days=1)
-    if dates_series.dt.tz is not None:
-        start_ts = start_ts.tz_localize(dates_series.dt.tz)
-        end_ts = end_ts.tz_localize(dates_series.dt.tz)
-    date_mask = dates_series.ge(start_ts) & dates_series.lt(end_ts)
-    filter_mask &= date_mask | dates_series.isna()
+    dates_series = df_raw['date_str']
+    start_date = start_d.isoformat()
+    end_date = (pd.Timestamp(end_d) + pd.Timedelta(days=1)).date().isoformat()
+    date_codes = dates_series.cat.codes
+    date_categories = dates_series.cat.categories
+    start_code = date_categories.searchsorted(start_date)
+    end_code = date_categories.searchsorted(end_date)
+    unknown_date_code = date_categories.get_loc('Unknown Date')
+    date_mask = date_codes.ge(start_code) & date_codes.lt(end_code)
+    filter_mask &= date_mask | date_codes.eq(unknown_date_code)
 
 # All transactions are finalized (success or failed) — no pending in dataset
 filtered_df = df_raw if filter_mask.all() else df_raw.loc[filter_mask]
 if filtered_df.empty:
     st.warning("No transactions match the selected filters.")
     st.stop()
+del filter_mask
 
 df_completed = filtered_df
 total_all = len(filtered_df)
@@ -670,14 +788,15 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # Duration Calculations
-df_success = df_completed[df_completed['transaction_status'] == 'success']
-df_failed = df_completed[df_completed['transaction_status'] == 'failed']
+success_mask = df_completed['transaction_status'] == 'success'
+failure_mask = df_completed['transaction_status'] == 'failed'
 
-succ_durations = df_success['duration_seconds'].dropna()
-fail_durations = df_failed['duration_seconds'].dropna()
+succ_durations = df_completed.loc[success_mask, 'duration_seconds'].dropna()
+fail_durations = df_completed.loc[failure_mask, 'duration_seconds'].dropna()
 
-succ_count = len(df_success)
-failed_count = len(df_failed)
+succ_count = int(success_mask.sum())
+failed_count = int(failure_mask.sum())
+del success_mask, failure_mask
 succ_rate = (succ_count / total_completed * 100) if total_completed > 0 else 0
 fail_rate = (failed_count / total_completed * 100) if total_completed > 0 else 0
 
@@ -776,6 +895,17 @@ selected_analytics_view = st.selectbox(
         "Transaction Explorer",
     ],
 )
+
+success_view_columns = {
+    'Gateway Speed Ranking': ['duration_seconds', 'response_code'],
+    'Daily Completion Trends': ['date_str', 'duration_seconds'],
+}.get(selected_analytics_view)
+if success_view_columns:
+    success_mask = df_completed['transaction_status'].eq('success')
+    df_success = df_completed.loc[success_mask, success_view_columns]
+    del success_mask
+else:
+    df_success = None
 
 # ==============================================================================
 # TAB 1: TURNAROUND & SLA OVERVIEW
@@ -933,7 +1063,7 @@ if selected_analytics_view == 'Duration Bands Deep Dive':
     
     if not df_completed.empty:
         band_summary = df_completed.groupby('duration_band', observed=False).agg(
-            Total_Count=('transaction_id', 'count'),
+            Total_Count=('transaction_status', 'size'),
             Success_Count=('transaction_status', lambda s: (s == 'success').sum()),
             Failed_Count=('transaction_status', lambda s: (s == 'failed').sum()),
             Mean_Duration=('duration_seconds', 'mean'),
@@ -1117,7 +1247,7 @@ if selected_analytics_view == 'Client Analysis':
     
     if not df_completed.empty and 'client_name' in df_completed.columns:
         client_agg = df_completed.groupby('client_name', observed=False).agg(
-            Total_Tx=('transaction_id', 'count'),
+            Total_Tx=('transaction_status', 'size'),
             Success_Tx=('transaction_status', lambda s: (s == 'success').sum()),
             Failed_Tx=('transaction_status', lambda s: (s == 'failed').sum()),
             Total_Debit_Amt=('debit_amt', 'sum'),
@@ -1351,10 +1481,12 @@ if selected_analytics_view == 'Daily Completion Trends':
     st.markdown("#### 📈 How Has Completion Speed Trended Over Time?")
     st.caption("Tracking daily turnaround times to detect latency degradations or network slowdowns.")
     
-    df_dated_succ = df_success.dropna(subset=['date_dt', 'duration_seconds']).copy()
+    df_dated_succ = df_success[
+        df_success['date_str'] != 'Unknown Date'
+    ].dropna(subset=['duration_seconds'])
     
     if not df_dated_succ.empty:
-        daily_speed = df_dated_succ.groupby(df_dated_succ['date_dt'].dt.date).agg(
+        daily_speed = df_dated_succ.groupby('date_str', observed=True).agg(
             Volume=('duration_seconds', 'count'),
             Median_s=('duration_seconds', 'median'),
             P75_s=('duration_seconds', lambda s: s.quantile(0.75)),
@@ -1362,7 +1494,7 @@ if selected_analytics_view == 'Daily Completion Trends':
             Pct_Under_5s=('duration_seconds', lambda s: (s <= 5).mean() * 100),
             Pct_Over_30s=('duration_seconds', lambda s: (s > 30).mean() * 100)
         ).reset_index()
-        daily_speed.rename(columns={'date_dt': 'Date'}, inplace=True)
+        daily_speed.rename(columns={'date_str': 'Date'}, inplace=True)
         
         fig_daily_speed = go.Figure()
         fig_daily_speed.add_trace(go.Scatter(
@@ -1684,13 +1816,22 @@ if selected_analytics_view == 'Transaction Type Analysis':
     transaction_type_summary = filtered_df.groupby(
         'transaction_type', observed=True
     ).agg(
-        Transactions=('transaction_id', 'size'),
-        Success_Count=('transaction_status', lambda values: (values == 'success').sum()),
-        Failed_Count=('transaction_status', lambda values: (values == 'failed').sum()),
+        Transactions=('transaction_status', 'size'),
         Median_Duration_s=('duration_seconds', 'median'),
         Mean_Duration_s=('duration_seconds', 'mean'),
         Amount_GHS=('debit_amt', 'sum'),
-    ).reset_index()
+    )
+    type_outcomes = filtered_df.groupby(
+        ['transaction_type', 'transaction_status'], observed=True
+    ).size().unstack(fill_value=0)
+    type_status = type_outcomes.stack().reset_index(name='Transactions')
+    transaction_type_summary['Success_Count'] = type_outcomes.get(
+        'success', pd.Series(0, index=type_outcomes.index)
+    )
+    transaction_type_summary['Failed_Count'] = type_outcomes.get(
+        'failed', pd.Series(0, index=type_outcomes.index)
+    )
+    transaction_type_summary = transaction_type_summary.reset_index()
     transaction_type_summary['Completed_Count'] = (
         transaction_type_summary['Success_Count']
         + transaction_type_summary['Failed_Count']
@@ -1724,9 +1865,6 @@ if selected_analytics_view == 'Transaction Type Analysis':
         "Top type share", f"{top_type['Share_of_Total_%']:.1f}%"
     )
 
-    type_status = filtered_df.groupby(
-        ['transaction_type', 'transaction_status'], observed=True
-    ).size().reset_index(name='Transactions')
     type_chart_col, latency_chart_col = st.columns(2)
     with type_chart_col:
         fig_type_volume = px.bar(
@@ -1753,11 +1891,14 @@ if selected_analytics_view == 'Transaction Type Analysis':
         st.plotly_chart(fig_type_volume, use_container_width=True)
 
     with latency_chart_col:
-        successful_type_latency = df_success.groupby(
-            'transaction_type', observed=True
+        successful_type_latency = filtered_df.groupby(
+            ['transaction_type', 'transaction_status'], observed=True
         ).agg(
             Median_Duration_s=('duration_seconds', 'median'),
         ).reset_index()
+        successful_type_latency = successful_type_latency[
+            successful_type_latency['transaction_status'] == 'success'
+        ].drop(columns='transaction_status')
         successful_type_latency = successful_type_latency.dropna(
             subset=['Median_Duration_s']
         ).sort_values('Median_Duration_s', ascending=False)
@@ -1839,7 +1980,6 @@ if selected_analytics_view == 'Transaction Explorer':
         )
         
     source_df = filtered_df if "Current Filtered View" in scope_option else df_raw
-    
     # --------------------------------------------------------------------------
     # PRESET 1: TOP 100 TRANSACTIONS BY LEAST DURATION (FASTEST)
     # --------------------------------------------------------------------------
@@ -1847,9 +1987,15 @@ if selected_analytics_view == 'Transaction Explorer':
         st.markdown("---")
         st.markdown("##### ⚡ Top 100 Transactions by Least Duration (Fastest Execution)")
         
-        # Filter valid durations and sort ascending
-        valid_df = source_df.dropna(subset=['duration_seconds'])
-        top100_least = valid_df.sort_values(by='duration_seconds', ascending=True).head(100).copy()
+        # Select the 100 fastest rows without sorting and copying the full dataset.
+        top_indices = source_df['duration_seconds'].dropna().nsmallest(100).index
+        top100_least = source_df.loc[top_indices].copy()
+        transaction_ids = load_transaction_ids(
+            data_folder='data',
+            dataset_fingerprint=dataset_fingerprint,
+            row_indices=tuple(top_indices),
+        )
+        top100_least['transaction_id'] = transaction_ids
         
         if top100_least.empty:
             st.warning("No transactions found with valid duration in the selected scope.")
@@ -1968,9 +2114,15 @@ if selected_analytics_view == 'Transaction Explorer':
         st.markdown("---")
         st.markdown("##### 🛑 Top 100 Transactions by Highest Duration (Slowest Execution)")
         
-        # Filter valid durations and sort descending
-        valid_df = source_df.dropna(subset=['duration_seconds'])
-        top100_highest = valid_df.sort_values(by='duration_seconds', ascending=False).head(100).copy()
+        # Select the 100 slowest rows without sorting and copying the full dataset.
+        top_indices = source_df['duration_seconds'].dropna().nlargest(100).index
+        top100_highest = source_df.loc[top_indices].copy()
+        transaction_ids = load_transaction_ids(
+            data_folder='data',
+            dataset_fingerprint=dataset_fingerprint,
+            row_indices=tuple(top_indices),
+        )
+        top100_highest['transaction_id'] = transaction_ids
         
         if top100_highest.empty:
             st.warning("No transactions found with valid duration in the selected scope.")
@@ -2108,25 +2260,56 @@ if selected_analytics_view == 'Transaction Explorer':
         with col_exp3:
             rows_to_display = st.selectbox("Rows to display:", options=[50, 100, 250, 500, 1000], index=1)
             
-        cols_export = [c for c in ['date_str', 'transaction_id', 'transaction_status', 'transaction_type', 'duration_seconds', 'duration_band', 'recon_action', 'response_code', 'client_name', 'debit_amt'] if c in source_df.columns]
-        display_df = source_df[cols_export].copy()
-        
-        # Apply sorting
-        if sort_order == "Duration (Lowest to Highest)":
-            display_df = display_df.sort_values(by='duration_seconds', ascending=True)
-        elif sort_order == "Duration (Highest to Lowest)":
-            display_df = display_df.sort_values(by='duration_seconds', ascending=False)
-        elif sort_order == "Amount (Highest to Lowest)" and 'debit_amt' in display_df.columns:
-            display_df = display_df.sort_values(by='debit_amt', ascending=False)
-        elif 'date_str' in display_df.columns:
-            display_df = display_df.sort_values(by='date_str', ascending=False)
-            
-        display_df['Turnaround (Readable)'] = display_df['duration_seconds'].apply(format_duration_friendly)
-        
         if search_tx:
+            transaction_ids = load_transaction_ids(
+                data_folder='data',
+                dataset_fingerprint=dataset_fingerprint,
+            )
+            source_df = source_df.copy(deep=False)
+            source_df['transaction_id'] = transaction_ids.loc[source_df.index]
+
+        cols_export = [
+            c for c in [
+                'date_str', 'transaction_id', 'transaction_status',
+                'transaction_type', 'duration_seconds', 'duration_band',
+                'recon_action', 'response_code', 'client_name', 'debit_amt',
+            ]
+            if c in source_df.columns
+        ]
+        if search_tx:
+            display_df = source_df[cols_export].copy()
+            if sort_order == "Duration (Lowest to Highest)":
+                display_df = display_df.sort_values(by='duration_seconds', ascending=True)
+            elif sort_order == "Duration (Highest to Lowest)":
+                display_df = display_df.sort_values(by='duration_seconds', ascending=False)
+            elif sort_order == "Amount (Highest to Lowest)" and 'debit_amt' in display_df.columns:
+                display_df = display_df.sort_values(by='debit_amt', ascending=False)
+            elif 'date_str' in display_df.columns:
+                display_df = display_df.sort_values(by='date_str', ascending=False)
+
+            display_df['Turnaround (Readable)'] = display_df['duration_seconds'].apply(format_duration_friendly)
             mask = display_df.astype(str).apply(lambda row: row.str.contains(search_tx, case=False).any(), axis=1)
             display_df = display_df[mask]
             st.caption(f"Found {len(display_df):,} matching transactions.")
+        else:
+            ranking_limit = 5000
+            if sort_order == "Duration (Lowest to Highest)":
+                ordered_indices = source_df['duration_seconds'].nsmallest(ranking_limit).index
+            elif sort_order == "Duration (Highest to Lowest)":
+                ordered_indices = source_df['duration_seconds'].nlargest(ranking_limit).index
+            elif sort_order == "Amount (Highest to Lowest)" and 'debit_amt' in source_df.columns:
+                ordered_indices = source_df['debit_amt'].nlargest(ranking_limit).index
+            else:
+                ordered_indices = source_df['date_str'].cat.codes.nlargest(ranking_limit).index
+
+            display_df = source_df.loc[ordered_indices, cols_export].copy()
+            transaction_ids = load_transaction_ids(
+                data_folder='data',
+                dataset_fingerprint=dataset_fingerprint,
+                row_indices=tuple(ordered_indices),
+            )
+            display_df['transaction_id'] = transaction_ids
+            display_df['Turnaround (Readable)'] = display_df['duration_seconds'].apply(format_duration_friendly)
             
         # Reorder columns nicely
         front_cols = [c for c in ['date_str', 'transaction_id', 'transaction_status', 'Turnaround (Readable)', 'duration_seconds'] if c in display_df.columns]
