@@ -237,14 +237,44 @@ def categorical_with_default(series, default, lowercase=False):
     return series.fillna(default)
 
 
+def get_dataset_fingerprint(data_folder='data'):
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    resolved_data_folder = (
+        data_folder
+        if os.path.isabs(data_folder)
+        else os.path.join(app_dir, data_folder)
+    )
+    parquet_file = next(
+        (
+            os.path.join(resolved_data_folder, filename)
+            for filename in ('transactions.parquet', 'transactions_opt.parquet')
+            if os.path.exists(os.path.join(resolved_data_folder, filename))
+        ),
+        None,
+    )
+    source_files = (
+        [parquet_file]
+        if parquet_file is not None
+        else sorted(glob.glob(os.path.join(resolved_data_folder, '*.csv')))
+    )
+    fingerprint = []
+    for path in source_files:
+        stat = os.stat(path)
+        fingerprint.append(
+            (os.path.abspath(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+        )
+    return tuple(fingerprint)
+
+
 @st.cache_resource(
     show_spinner="Consolidating data files and computing latency...",
     max_entries=2,
 )
-def load_and_preprocess_combined_data(data_folder='data'):
+def load_and_preprocess_combined_data(data_folder='data', dataset_fingerprint=None):
     """
     Loads the prepared dataset when available, otherwise combines CSV parts,
     standardizes schemas, calculates duration from timestamps, and handles Recon Actions.
+    dataset_fingerprint is included in the cache key to reload updated source files.
     """
     app_dir = os.path.dirname(os.path.abspath(__file__))
     resolved_data_folder = (
@@ -275,18 +305,27 @@ def load_and_preprocess_combined_data(data_folder='data'):
             'duration_seconds',
             'date_str',
             'duration_band',
-        ] if os.path.basename(parquet_file) == 'transactions.parquet' else None
+        ]
         df = pd.read_parquet(
             parquet_file,
             columns=parquet_columns,
             dtype_backend="pyarrow",
         )
-        if os.path.basename(parquet_file) == 'transactions.parquet':
-            df['date_dt'] = df['time_created'].astype('timestamp[us, tz=UTC][pyarrow]')
-            df['transaction_type'] = categorical_with_default(
-                df['transaction_type'], 'Unknown Type'
-            )
-            return df.drop(columns=['time_created'])
+        # time_created is stored as timestamp[us, tz=UTC] — use it as date_dt directly
+        df['date_dt'] = df['time_created']
+        df['transaction_status'] = categorical_with_default(
+            df['transaction_status'], 'unknown', lowercase=True
+        )
+        df['transaction_type'] = categorical_with_default(
+            df['transaction_type'], 'Unknown Type'
+        )
+        for col in ['response_code', 'recon_action', 'client_name', 'duration_band']:
+            if col in df.columns:
+                df[col] = df[col].astype('category')
+        df['transaction_id'] = df['transaction_id'].fillna('N/A').astype('string[pyarrow]')
+        df['debit_amt'] = pd.to_numeric(df['debit_amt'], errors='coerce').fillna(0.0)
+        df['duration_seconds'] = pd.to_numeric(df['duration_seconds'], errors='coerce').abs()
+        return df.drop(columns=['time_created'])
     elif csv_files:
         dfs = [pd.read_csv(f, dtype_backend="pyarrow") for f in csv_files]
         df = pd.concat(dfs, ignore_index=True)
@@ -429,7 +468,11 @@ def load_and_preprocess_combined_data(data_folder='data'):
 with st.sidebar:
     st.markdown("### ⚙️ Dashboard Controls")
     try:
-        df_raw = load_and_preprocess_combined_data(data_folder='data')
+        dataset_fingerprint = get_dataset_fingerprint(data_folder='data')
+        df_raw = load_and_preprocess_combined_data(
+            data_folder='data',
+            dataset_fingerprint=dataset_fingerprint,
+        )
     except Exception as e:
         st.error(f"Error loading dataset: {e}")
         st.stop()
@@ -604,21 +647,15 @@ if selected_date_range and isinstance(selected_date_range, (tuple, list)) and le
     date_mask = dates_series.ge(start_ts) & dates_series.lt(end_ts)
     filter_mask &= date_mask | dates_series.isna()
 
-# CORE ARCHITECTURE: Strict Pending Status Separation
+# All transactions are finalized (success or failed) — no pending in dataset
 filtered_df = df_raw if filter_mask.all() else df_raw.loc[filter_mask]
 if filtered_df.empty:
     st.warning("No transactions match the selected filters.")
     st.stop()
 
-completed_mask = filtered_df['transaction_status'].isin(['success', 'failed'])
-df_completed = filtered_df if completed_mask.all() else filtered_df.loc[completed_mask]
-pending_mask = filtered_df['transaction_status'] == 'pending'
-df_pending = filtered_df.loc[pending_mask] if pending_mask.any() else filtered_df.iloc[:0]
-
+df_completed = filtered_df
 total_all = len(filtered_df)
-total_completed = len(df_completed)
-total_pending = len(df_pending)
-pending_pct = (total_pending / total_all * 100) if total_all > 0 else 0
+total_completed = total_all
 
 # Hero Header Section
 st.markdown(f"""
@@ -631,16 +668,6 @@ st.markdown(f"""
     </div>
 </div>
 """, unsafe_allow_html=True)
-
-# Pending Status Separation Banner
-if total_pending > 0:
-    st.markdown(f"""
-    <div class="alert-banner">
-        <strong>⚠️ Pending Transactions Isolated ({total_pending:,} in-flight &bull; {pending_pct:.2f}% of filtered volume):</strong> 
-        Pending transactions have not yet reached completion. All completion charts and SLA metrics below evaluate 
-        finalized transactions (<strong>Success vs Failed</strong>) so pending states do not distort latency calculations.
-    </div>
-    """, unsafe_allow_html=True)
 
 # Duration Calculations
 df_success = df_completed[df_completed['transaction_status'] == 'success']
