@@ -446,6 +446,7 @@ def load_and_preprocess_combined_data(data_folder='data', dataset_fingerprint=No
             
     df = df.rename(columns=col_map)
     df = df.loc[:, ~df.columns.duplicated()]
+    df = df.drop(columns=['client_id'], errors='ignore')
     
     # Clean transaction_status
     if 'transaction_status' not in df.columns:
